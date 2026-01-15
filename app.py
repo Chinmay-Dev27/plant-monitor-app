@@ -1,111 +1,182 @@
 import streamlit as st
-from streamlit_cropper import st_cropper
-from PIL import Image
 import pytesseract
+from PIL import Image
 import numpy as np
 import cv2
 import shutil
+import pandas as pd
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Plant Monitor AI", page_icon="🏭")
-st.title("🏭 Plant Efficiency & Safety Monitor")
+st.title("🏭 Smart Plant Monitor (Auto-Locate)")
 
 # --- 1. SETUP ---
 if not shutil.which("tesseract"):
     st.error("❌ CRITICAL ERROR: Tesseract is missing! Check packages.txt")
     st.stop()
 
-# --- 2. PERCENTAGE COORDINATES ---
-# Format: [Top%, Bottom%, Left%, Right%]
-# These values will stretch to fit ANY image size automatically.
-ROIS_PCT = {
-    "Total Air Flow": [0.22, 0.26, 0.16, 0.23],  # ~22% down, 16% left
-    "Fan A Amps":     [0.26, 0.30, 0.81, 0.88],  # ~26% down, 81% left
-    "Fan A Vib (DE)": [0.26, 0.30, 0.64, 0.70],  # ~26% down, 64% left
-    "Fan B Amps":     [0.53, 0.57, 0.81, 0.88]   # ~53% down, 81% left
-}
-
-def analyze_image(image):
-    img_array = np.array(image)
-    height, width, _ = img_array.shape
+# --- 2. INTELLIGENT PARSER ENGINE ---
+def find_value_near_label(df, label_keywords, search_area='right', x_limit=300, y_limit=50):
+    """
+    Scans the OCR data for a specific label and finds the nearest number next to it.
+    df: The dataframe containing all text found by OCR.
+    label_keywords: A list of words to match (e.g., ["AIR", "FLOW"])
+    search_area: 'right' (standard) or 'below' (for tables).
+    """
+    # 1. Find the Label
+    # We look for rows in the data that contain our keywords
+    matches = df[df['text'].str.contains(label_keywords[0], case=False, na=False)]
     
-    results = {}
-    debug_img = img_array.copy()
-    
-    for name, pct in ROIS_PCT.items():
-        # Convert % to Pixels for this specific image
-        y1 = int(pct[0] * height)
-        y2 = int(pct[1] * height)
-        x1 = int(pct[2] * width)
-        x2 = int(pct[3] * width)
-        
-        # Draw Box (Blue) for debugging
-        cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 0, 255), 3)
+    if matches.empty:
+        return 0.0, None
 
-        # Crop & OCR
-        # Add a small padding (margin) to ensure we don't cut the number
-        roi_crop = img_array[y1:y2, x1:x2]
+    # Get coordinates of the label
+    label_x = matches.iloc[0]['left'] + matches.iloc[0]['width'] # Right edge of label
+    label_y = matches.iloc[0]['top']
+    label_h = matches.iloc[0]['height']
+
+    # 2. Search for the Value
+    # We filter for text that is:
+    # - To the RIGHT of the label (within x_limit pixels)
+    # - On the SAME LINE (within y_limit pixels vertical)
+    # - Is a Number
+    
+    candidates = df[
+        (df['left'] > label_x) & 
+        (df['left'] < label_x + x_limit) &
+        (abs(df['top'] - label_y) < y_limit)
+    ]
+
+    for index, row in candidates.iterrows():
+        text = str(row['text']).strip()
+        # Clean the text to see if it's a number
+        clean_val = ''.join(c for c in text if c.isdigit() or c == '.')
         
-        # Pre-processing
-        gray = cv2.cvtColor(roi_crop, cv2.COLOR_RGB2GRAY)
-        
-        # Upscale slightly to help OCR read small text
-        gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-        
-        # Thresholding
-        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
-        
-        try:
-            val_text = pytesseract.image_to_string(thresh, config=r'--oem 3 --psm 6 outputbase digits')
-            # Extract just the number
-            val_clean = ''.join(c for c in val_text if c.isdigit() or c == '.')
-            
-            # Handling multiple dots error (e.g. "25.17.3")
-            if val_clean.count('.') > 1:
-                val_clean = val_clean.replace('.', '', val_clean.count('.') - 1)
+        # Validation: Must have at least one digit and not be empty
+        if clean_val and any(c.isdigit() for c in clean_val):
+            try:
+                # Handle double dots error (e.g. "723..66")
+                if clean_val.count('.') > 1:
+                    clean_val = clean_val.replace('.', '', clean_val.count('.') - 1)
+                return float(clean_val), (row['left'], row['top'], row['width'], row['height'])
+            except:
+                continue
                 
-            results[name] = float(val_clean) if val_clean else 0.0
-        except:
-            results[name] = 0.0
-            
-    return results, debug_img
+    return 0.0, None
 
-# --- 3. UI WORKFLOW ---
-st.write("### Step 1: Capture or Upload")
+def process_image(image):
+    # Convert to numpy
+    img_array = np.array(image)
+    
+    # 1. Pre-processing (Critical for digital fonts)
+    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    # Resize: Double the size to make small numbers readable
+    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    # Threshold: Make it black and white
+    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+
+    # 2. Run OCR on the WHOLE image once
+    # output_type='data.frame' gives us a table of every word and its x,y location
+    custom_config = r'--oem 3 --psm 6'
+    data = pytesseract.image_to_data(thresh, config=custom_config, output_type='data.frame')
+    
+    # Clean up data (remove empty rows)
+    data = data[data.conf != -1]
+    data['text'] = data['text'].astype(str).str.strip()
+    data = data[data['text'] != '']
+
+    # 3. Smart Search Definitions
+    # We map "Variable Name" -> "Keywords to find"
+    results = {}
+    debug_boxes = [] # To draw on image later
+
+    # Define what we are looking for
+    targets = {
+        "Total Air Flow": ["FLOW"],      # Looks for "FLOW" (from AIR FLOW)
+        "Fan A Amps": ["25."],           # HACK: Looking for the unique value region if label is missing
+        "Fan B Amps": ["35."],           # HACK: Looking for unique value region
+        # Better approach for identical labels (like "Amps" appearing twice):
+        # We can split the image into Top/Bottom halves!
+    }
+    
+    # --- STRATEGY FOR DUPLICATE LABELS (Fan A vs Fan B) ---
+    # Since "Amps" appears twice, we split the dataframe into Top and Bottom
+    midpoint = data['top'].max() / 2
+    
+    top_data = data[data['top'] < midpoint]
+    bot_data = data[data['top'] >= midpoint]
+
+    # Find Air Flow (Top Left usually)
+    val, box = find_value_near_label(top_data, ["FLOW"])
+    results["Total Air Flow"] = val
+    if box: debug_boxes.append(box)
+
+    # Find Fan A Amps (Top Half, look for 'Amps' label)
+    val, box = find_value_near_label(top_data, ["Amps"], search_area='left', x_limit=150) 
+    # Note: On your screen, "Amps" is to the RIGHT of the number. 
+    # So we actually need to look to the LEFT of the label "Amps".
+    
+    # Let's fix the logic for "Amps" specifically.
+    # The screen says: "25.173 Amps". The label is AFTER the number.
+    # So we find "Amps", then look at the word immediately BEFORE it.
+    
+    # --- REVISED LOGIC FOR "NUMBER BEFORE LABEL" ---
+    def find_val_before_label(df, label_keyword):
+        matches = df[df['text'].str.contains(label_keyword, case=False)]
+        if matches.empty: return 0.0, None
+        
+        # Get the word index
+        idx = matches.index[0]
+        # Look at the previous word (index - 1)
+        if idx - 1 in df.index:
+            prev_word = df.loc[idx-1]
+            text = str(prev_word['text'])
+            clean_val = ''.join(c for c in text if c.isdigit() or c == '.')
+            if clean_val:
+                return float(clean_val), (prev_word['left'], prev_word['top'], prev_word['width'], prev_word['height'])
+        return 0.0, None
+
+    # Run specific searches
+    # Fan A Amps (Top Half)
+    val_a, box_a = find_val_before_label(top_data, "Amps")
+    results["Fan A Amps"] = val_a
+    if box_a: debug_boxes.append(box_a)
+
+    # Fan B Amps (Bottom Half)
+    val_b, box_b = find_val_before_label(bot_data, "Amps")
+    results["Fan B Amps"] = val_b
+    if box_b: debug_boxes.append(box_b)
+
+    # Vibration (This is harder because label is far away). 
+    # Let's try searching for "mm/se" which is unique!
+    # Fan A Vib (Top Half)
+    val_vib_a, box_vib_a = find_val_before_label(top_data, "mm/se")
+    results["Fan A Vib"] = val_vib_a
+    if box_vib_a: debug_boxes.append(box_vib_a)
+
+    return results, debug_boxes, gray
+
+# --- 3. UI ---
 img_file = st.file_uploader("Upload Image", type=['jpg', 'png', 'jpeg'])
-camera_file = st.camera_input("Or Take a Photo")
 
-real_file = camera_file if camera_file else img_file
-
-if real_file:
-    original_image = Image.open(real_file)
+if img_file:
+    image = Image.open(img_file)
+    st.image(image, caption="Original", width=400)
     
-    st.write("### Step 2: Crop the Screen")
-    st.info("👇 Drag the corners to frame the SCADA screen tightly.")
-    
-    # CROPPER
-    cropped_image = st_cropper(original_image, realtime_update=True, box_color='#FF0000', aspect_ratio=None)
-    
-    st.write("### Step 3: Analyze")
-    st.image(cropped_image, caption="Your Selection", width=400)
-    
-    if st.button("🚀 Run AI Analysis"):
-        with st.spinner("Processing..."):
-            data, debug_view = analyze_image(cropped_image)
+    if st.button("🚀 Analyze with Smart Search"):
+        with st.spinner("Reading full screen text..."):
+            results, boxes, processed_img = process_image(image)
             
-            # Show alignment check
-            st.image(debug_view, caption="AI Alignment Check (Blue Boxes)", use_container_width=True)
+            # Draw Debug Boxes on processed image to show what we found
+            debug_img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2RGB)
+            for (x, y, w, h) in boxes:
+                cv2.rectangle(debug_img, (x, y), (x + w, y + h), (0, 255, 0), 5)
+            
+            st.image(debug_img, caption="Green Boxes = What AI Found", use_container_width=True)
             
             # Dashboard
             c1, c2 = st.columns(2)
-            c1.metric("Total Air Flow", f"{data['Total Air Flow']} T/Hr")
-            c1.metric("Fan A Amps", f"{data['Fan A Amps']} A")
-            c2.metric("Fan B Amps", f"{data['Fan B Amps']} A")
-            
-            vib = data['Fan A Vib (DE)']
-            if vib > 7.1:
-                c2.error(f"🚨 Vib A: {vib} mm/s (TRIP)")
-            elif vib > 4.5:
-                c2.warning(f"⚠️ Vib A: {vib} mm/s (ALARM)")
-            else:
-                c2.success(f"✅ Vib A: {vib} mm/s")
+            c1.metric("Total Air Flow", f"{results.get('Total Air Flow', 0)} T/Hr")
+            c1.metric("Fan A Amps", f"{results.get('Fan A Amps', 0)} A")
+            c2.metric("Fan B Amps", f"{results.get('Fan B Amps', 0)} A")
+            c2.metric("Fan A Vib", f"{results.get('Fan A Vib', 0)} mm/s")

@@ -8,10 +8,15 @@ import cv2
 st.set_page_config(page_title="Plant Monitor AI", page_icon="🏭")
 
 st.title("🏭 Plant Efficiency & Safety Monitor")
-st.write("Upload a photo of the FD Fan SCADA Screen")
 
-# --- 1. COORDINATE MAPPING (ROI) ---
-# Format: [y_min, y_max, x_min, x_max] based on 1000x666 reference
+# --- 1. SETUP & DEBUGGING ---
+# check if tesseract is actually installed in the system
+import shutil
+tesseract_cmd = shutil.which("tesseract")
+if tesseract_cmd is None:
+    st.warning("⚠️ Tesseract binary not found! Did you create packages.txt?")
+
+# Coordinate Mapping (Based on your SCADA screen)
 ROIS = {
     "Total Air Flow": [220, 255, 175, 260],
     "Fan A Amps": [275, 300, 840, 910],
@@ -19,83 +24,78 @@ ROIS = {
     "Fan B Amps": [520, 545, 830, 900]
 }
 
-def extract_value_from_roi(image, roi_coords):
-    # Crop the image
+def extract_value_from_roi(image, roi_coords, label):
     y1, y2, x1, x2 = roi_coords
+    
+    # Safety Check: Image size
     if y2 > image.shape[0] or x2 > image.shape[1]:
-        return 0.0
-        
+        return 0.0, f"Error: Image too small for {label}"
+
     cropped = image[y1:y2, x1:x2]
     
-    # Pre-processing to make text clearer for Tesseract
+    # Image Pre-processing
     gray = cv2.cvtColor(cropped, cv2.COLOR_RGB2GRAY)
-    # Thresholding turns grey pixels into pure black or white
     _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
     
-    # Run Tesseract OCR
-    # config: search for numbers only
-    custom_config = r'--oem 3 --psm 6 outputbase digits'
-    text = pytesseract.image_to_string(thresh, config=custom_config)
-    
-    # Cleanup text to get float
     try:
-        # Remove anything that isn't a digit or dot
+        # Tesseract Configuration
+        custom_config = r'--oem 3 --psm 6 outputbase digits'
+        text = pytesseract.image_to_string(thresh, config=custom_config)
+        
+        # Clean text
         clean_text = ''.join(c for c in text if c.isdigit() or c == '.')
-        return float(clean_text)
-    except:
-        return 0.0
+        return float(clean_text) if clean_text else 0.0, None
+    except Exception as e:
+        return 0.0, str(e)
 
-# --- 2. MAIN APP LOGIC ---
-uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "png", "jpeg"])
+# --- 2. MAIN INTERFACE ---
+uploaded_file = st.file_uploader("Upload SCADA Screen", type=["jpg", "png", "jpeg"])
 
 if uploaded_file is not None:
-    image = Image.open(uploaded_file)
-    img_array = np.array(image)
+    st.info("✅ Image received! Processing...") # Debug message
     
-    # Resize to standard width (1000px) so ROIs match
-    aspect_ratio = img_array.shape[0] / img_array.shape[1]
-    target_width = 1000
-    target_height = int(target_width * aspect_ratio)
-    img_resized = cv2.resize(img_array, (target_width, target_height))
-
-    st.image(image, caption='Uploaded SCADA Screen', use_column_width=True)
-    
-    st.subheader("📊 Live Analysis")
-    
-    with st.spinner('Scanning SCADA parameters...'):
-        # Extract values
-        flow = extract_value_from_roi(img_resized, ROIS["Total Air Flow"])
-        amps_a = extract_value_from_roi(img_resized, ROIS["Fan A Amps"])
-        vib_a = extract_value_from_roi(img_resized, ROIS["Fan A Vib (DE)"])
-        amps_b = extract_value_from_roi(img_resized, ROIS["Fan B Amps"])
+    try:
+        # Load Image
+        image = Image.open(uploaded_file)
+        img_array = np.array(image)
         
-        # Display Results
-        col1, col2 = st.columns(2)
-        with col1:
-            st.info(f"**Total Air Flow:** {flow} T/Hr")
-            st.metric(label="Fan A Amps", value=amps_a)
-            st.metric(label="Fan B Amps", value=amps_b)
-            
-        with col2:
-            if vib_a > 7.1:
-                st.error(f"⚠️ FAN A VIBRATION: {vib_a} mm/s (TRIP)")
-            elif vib_a > 4.5:
-                st.warning(f"⚠️ FAN A VIBRATION: {vib_a} mm/s (ALARM)")
-            else:
-                st.success(f"✅ Fan A Vibration: {vib_a} mm/s")
+        # Resize safely to fixed width (matches your coordinates)
+        target_width = 1000
+        aspect_ratio = img_array.shape[0] / img_array.shape[1]
+        target_height = int(target_width * aspect_ratio)
+        img_resized = cv2.resize(img_array, (target_width, target_height))
+        
+        st.image(image, caption='Uploaded Image', use_column_width=True)
 
-    # --- 3. EXPERT TIPS ---
-    st.markdown("---")
-    st.subheader("💡 Expert Recommendations")
-    
-    tips = []
-    if abs(amps_a - amps_b) > 5.0:
-        tips.append(f"🔴 **Load Imbalance:** {round(abs(amps_a - amps_b), 2)} Amps diff. Check blade pitch.")
-    if vib_a > 4.5:
-        tips.append("🔴 **High Vibration:** Check foundation bolts & impeller.")
-    
-    if not tips:
-        st.write("✅ System Normal.")
-    else:
-        for tip in tips:
-            st.write(tip)
+        # Run Extraction
+        with st.spinner('Reading Data...'):
+            flow, err1 = extract_value_from_roi(img_resized, ROIS["Total Air Flow"], "Flow")
+            amps_a, err2 = extract_value_from_roi(img_resized, ROIS["Fan A Amps"], "Amps A")
+            vib_a, err3 = extract_value_from_roi(img_resized, ROIS["Fan A Vib (DE)"], "Vib A")
+            amps_b, err4 = extract_value_from_roi(img_resized, ROIS["Fan B Amps"], "Amps B")
+
+            # Check for errors
+            if any([err1, err2, err3, err4]):
+                st.error(f"OCR Error: {err1 or err2 or err3 or err4}")
+            else:
+                # Display Dashboard
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Total Air Flow", f"{flow} T/Hr")
+                    st.metric("Fan A Amps", f"{amps_a} A")
+                    st.metric("Fan B Amps", f"{amps_b} A")
+                with col2:
+                    if vib_a > 7.1:
+                        st.error(f"🚨 Vib A: {vib_a} mm/s (TRIP)")
+                    elif vib_a > 4.5:
+                        st.warning(f"⚠️ Vib A: {vib_a} mm/s (ALARM)")
+                    else:
+                        st.success(f"✅ Vib A: {vib_a} mm/s")
+                
+                # Logic Recommendations
+                st.markdown("---")
+                if abs(amps_a - amps_b) > 5:
+                    st.warning(f"💡 Recommendation: Check load imbalance ({abs(amps_a-amps_b):.1f} A diff)")
+
+    except Exception as main_error:
+        st.error(f"System Crash: {main_error}")

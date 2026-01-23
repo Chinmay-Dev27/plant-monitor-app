@@ -1,5 +1,4 @@
 import streamlit as st
-from streamlit_cropper import st_cropper
 from PIL import Image
 import pytesseract
 import numpy as np
@@ -7,189 +6,151 @@ import cv2
 import shutil
 
 # --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="Plant Monitor AI", layout="wide", page_icon="🏭")
-st.title("🏭 FD Fan Efficiency & Health Monitor")
+st.set_page_config(page_title="Auto-Align Monitor", layout="wide", page_icon="🏭")
+st.title("🏭 Plant Monitor (Auto-Align Tech)")
 
-# --- 1. CONFIGURATION: YOUR MAPPED PARAMETERS ---
-# These are the exact percentage coordinates you mapped.
-# The app will look in these exact spots every time.
+# --- 1. YOUR MASTER COORDINATES (From your list) ---
+# You only need to map these ONCE on your "Reference Image"
 ROIS_PCT = {
     "Fuel Flow": [0.07, 0.11, 0.10, 0.17],
     "Air Flow": [0.11, 0.15, 0.10, 0.17],
-    "Fuel/Air Ratio": [0.15, 0.19, 0.10, 0.17],
-    "Fur DP": [0.19, 0.23, 0.10, 0.17],
-    "To SCAPH-A DP": [0.30, 0.34, 0.12, 0.19],
-    "To SCAPH-A Temp": [0.34, 0.38, 0.12, 0.19],
-    "To SCAPH-B DP": [0.49, 0.53, 0.12, 0.19],
-    "To SCAPH-B Temp": [0.53, 0.57, 0.12, 0.19],
-    "Freq": [0.02, 0.06, 0.38, 0.45],
-    "ATM": [0.02, 0.06, 0.48, 0.55],
     "Load": [0.02, 0.06, 0.62, 0.69],
-    
-    # --- FD FAN A ---
     "FD Fan-A Amps": [0.10, 0.14, 0.48, 0.54],
-    "FD Fan-A Loading %": [0.08, 0.12, 0.27, 0.33],
-    "FD Fan-A LO Pressure": [0.22, 0.26, 0.23, 0.29],
-    "FD Fan-A LOP Temp": [0.42, 0.46, 0.27, 0.33], 
-    "FD Fan-A mmSe": [0.62, 0.66, 0.27, 0.33],  # Vibration
-    "FD Fan-A Temp1": [0.08, 0.12, 0.34, 0.40],
-    
-    # --- FD FAN B ---
+    "FD Fan-A Vib": [0.62, 0.66, 0.27, 0.33], 
     "FD Fan-B Amps": [0.38, 0.42, 0.48, 0.54],
-    "FD Fan-B Loading %": [0.08, 0.12, 0.62, 0.68],
-    "FD Fan-B LO Pressure": [0.22, 0.26, 0.58, 0.64],
-    "FD Fan-B LOP Temp": [0.42, 0.46, 0.62, 0.68],
-    "FD Fan-B mmSe": [0.62, 0.66, 0.62, 0.68],  # Vibration
-    
-    # --- CRITICAL UNIT PARAMETERS ---
-    "MS TMP": [0.16, 0.20, 0.85, 0.91],
-    "MS PR": [0.20, 0.24, 0.85, 0.91],
-    "HRH TMP": [0.24, 0.28, 0.85, 0.91],
-    "DR LVL": [0.32, 0.36, 0.85, 0.91],
-    "FW FL": [0.36, 0.40, 0.85, 0.91],
-    "PA HDR": [0.52, 0.56, 0.85, 0.91],
+    "FD Fan-B Vib": [0.62, 0.66, 0.62, 0.68],
+    # ... Paste the rest of your list here ...
 }
 
-# --- 2. SETUP OCR ENGINE ---
 if not shutil.which("tesseract"):
-    st.error("❌ CRITICAL ERROR: Tesseract is missing! Please ensure 'packages.txt' is in your GitHub repo.")
+    st.error("❌ Tesseract is missing! Check packages.txt")
     st.stop()
 
-def analyze_image(image):
-    # Convert image to numpy array for OpenCV
-    img_array = np.array(image)
-    h, w, _ = img_array.shape
+# --- 2. THE ALIGNMENT ENGINE ---
+def align_images(image, reference):
+    """
+    Warps 'image' to match the perspective of 'reference'.
+    """
+    # Convert to grayscale
+    img_gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    ref_gray = cv2.cvtColor(reference, cv2.COLOR_RGB2GRAY)
     
+    # MAX_FEATURES: Higher = more accuracy, slower speed
+    orb = cv2.ORB_create(MAX_FEATURES=1000)
+    
+    # Find keypoints and descriptors
+    keypoints1, descriptors1 = orb.detectAndCompute(img_gray, None)
+    keypoints2, descriptors2 = orb.detectAndCompute(ref_gray, None)
+    
+    # Match features
+    matcher = cv2.DescriptorMatcher_create(cv2.DESCRIPTOR_MATCHER_BRUTEFORCE_HAMMING)
+    matches = matcher.match(descriptors1, descriptors2, None)
+    
+    # Sort matches by score (best matches first)
+    matches.sort(key=lambda x: x.distance, reverse=False)
+    
+    # Remove bad matches (keep top 20%)
+    numGoodMatches = int(len(matches) * 0.20)
+    matches = matches[:numGoodMatches]
+    
+    if len(matches) < 4:
+        return None, "Not enough features found to align."
+
+    # Extract location of good matches
+    points1 = np.zeros((len(matches), 2), dtype=np.float32)
+    points2 = np.zeros((len(matches), 2), dtype=np.float32)
+    
+    for i, match in enumerate(matches):
+        points1[i, :] = keypoints1[match.queryIdx].pt
+        points2[i, :] = keypoints2[match.trainIdx].pt
+    
+    # Find Homography (The Magic Warp Matrix)
+    h, mask = cv2.findHomography(points1, points2, cv2.RANSAC)
+    
+    if h is None:
+        return None, "Could not compute perspective warp."
+        
+    # Use homography to warp image
+    height, width, _ = reference.shape
+    aligned_img = cv2.warpPerspective(image, h, (width, height))
+    
+    return aligned_img, None
+
+def analyze_data(image):
+    h, w, _ = image.shape
     results = {}
     
-    # Loop through every parameter in your list
     for name, coords in ROIS_PCT.items():
-        # 1. Convert Percentage to Pixels
+        # Convert % to pixels
         y1, y2, x1, x2 = int(coords[0]*h), int(coords[1]*h), int(coords[2]*w), int(coords[3]*w)
         
-        # 2. Safety Check (Bounds)
-        if y2 > h or x2 > w:
-            results[name] = 0.0
-            continue
+        # Crop & OCR
+        if y2 <= h and x2 <= w:
+            crop = image[y1:y2, x1:x2]
+            gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+            gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+            _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
             
-        # 3. Crop the specific box
-        crop = img_array[y1:y2, x1:x2]
-        
-        # 4. Image Enhancement for OCR (The "Magic" Step)
-        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-        # Resize: Zoom in 3x to make small numbers big and clear
-        gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-        # Threshold: Convert to pure black and white
-        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
-        
-        # 5. Run Tesseract OCR
-        try:
-            # Config: 'digits' ensures we don't accidentally read letters as numbers
-            text = pytesseract.image_to_string(thresh, config=r'--oem 3 --psm 6 outputbase digits')
-            
-            # 6. Cleaning the Result
-            # Keep only digits and dots
-            clean_text = ''.join(c for c in text if c.isdigit() or c == '.')
-            
-            # Handle "double dot" error (e.g., reading "25..17")
-            if clean_text.count('.') > 1:
-                clean_text = clean_text.replace('.', '', clean_text.count('.') - 1)
-            
-            # Store the result
-            results[name] = float(clean_text) if clean_text else 0.0
-        except:
+            try:
+                val = pytesseract.image_to_string(thresh, config=r'--oem 3 --psm 6 outputbase digits')
+                clean = ''.join(c for c in val if c.isdigit() or c == '.')
+                if clean.count('.') > 1: clean = clean.replace('.', '', clean.count('.') - 1)
+                results[name] = float(clean) if clean else 0.0
+            except:
+                results[name] = 0.0
+        else:
             results[name] = 0.0
             
     return results
 
-# --- 3. THE APP INTERFACE ---
-# Upload Section
-st.write("### 📸 Capture SCADA Screen")
-st.info("Upload a photo or take one. Crop exactly to the screen edges.")
+# --- 3. UI WORKFLOW ---
+st.write("### 🛠️ Setup: Reference Image")
+st.info("Upload the PERFECT screenshot you used to map the coordinates. The app will align all future photos to this one.")
 
-img_file = st.file_uploader("Upload Image", type=['jpg', 'png', 'jpeg'])
-camera_file = st.camera_input("Or Take a Photo")
-real_file = camera_file if camera_file else img_file
+ref_file = st.file_uploader("Upload REFERENCE Image (Master)", type=['jpg', 'png'])
 
-if real_file:
-    original = Image.open(real_file)
+if ref_file:
+    ref_image = np.array(Image.open(ref_file))
+    st.image(ref_image, caption="Master Reference Loaded", width=300)
     
-    # Cropper Tool
-    st.write("#### ✂️ Step 1: Crop to Edges")
-    cropped_img = st_cropper(original, realtime_update=True, box_color='#FF0000', aspect_ratio=None)
+    st.divider()
     
-    st.write("#### 📊 Step 2: Live Analysis")
-    if st.button("🚀 Run AI Analysis"):
-        with st.spinner("Extracting 30+ Parameters..."):
-            data = analyze_image(cropped_img)
+    st.write("### 📸 Daily Operation")
+    live_file = st.camera_input("Take a photo of the screen (Angle doesn't matter!)")
+    
+    if live_file:
+        live_image = np.array(Image.open(live_file))
+        
+        with st.spinner("Auto-Aligning Image..."):
+            # 1. Align
+            aligned_img, err = align_images(live_image, ref_image)
             
-            # --- DISPLAY DASHBOARD ---
-            
-            # Row 1: Key Performance Indicators (KPIs)
-            st.subheader("🔥 Key Plant KPIs")
-            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-            kpi1.metric("Load", f"{data.get('Load', 0)} MW")
-            kpi2.metric("Total Air Flow", f"{data.get('Air Flow', 0)} T/Hr")
-            kpi3.metric("Fuel Flow", f"{data.get('Fuel Flow', 0)} T/Hr")
-            kpi4.metric("Frequency", f"{data.get('Freq', 0)} Hz")
-            
-            st.divider()
-            
-            # Row 2: Fan A vs Fan B Comparison
-            st.subheader("⚙️ Fan Performance Comparison")
-            col_a, col_b = st.columns(2)
-            
-            with col_a:
-                st.markdown("### 🅰️ FD Fan A")
-                st.metric("Amps", f"{data.get('FD Fan-A Amps', 0)} A")
-                st.metric("Vibration", f"{data.get('FD Fan-A mmSe', 0)} mm/s", 
-                          delta_color="inverse" if data.get('FD Fan-A mmSe', 0) > 4.5 else "normal")
-                st.metric("Lube Oil Pr", f"{data.get('FD Fan-A LO Pressure', 0)}")
+            if aligned_img is not None:
+                # Show the user the magic
+                st.image(aligned_img, caption="✅ Auto-Corrected View (Aligned)", use_container_width=True)
                 
-                # Health Check Logic A
-                if data.get('FD Fan-A mmSe', 0) > 7.1:
-                    st.error("🚨 CRITICAL: High Vibration Trip Level!")
-                elif data.get('FD Fan-A mmSe', 0) > 4.5:
-                    st.warning("⚠️ ALARM: High Vibration Warning")
-            
-            with col_b:
-                st.markdown("### 🅱️ FD Fan B")
-                st.metric("Amps", f"{data.get('FD Fan-B Amps', 0)} A")
-                st.metric("Vibration", f"{data.get('FD Fan-B mmSe', 0)} mm/s",
-                          delta_color="inverse" if data.get('FD Fan-B mmSe', 0) > 4.5 else "normal")
-                st.metric("Lube Oil Pr", f"{data.get('FD Fan-B LO Pressure', 0)}")
-
-                # Health Check Logic B
-                if data.get('FD Fan-B mmSe', 0) > 7.1:
-                    st.error("🚨 CRITICAL: High Vibration Trip Level!")
+                # 2. Analyze
+                data = analyze_data(aligned_img)
                 
-            st.divider()
-            
-            # Row 3: Full Data Table (Expandable)
-            with st.expander("📋 View All Extracted Data"):
-                st.json(data)
-
-            # Row 4: Expert Recommendations
-            st.subheader("💡 AI Expert Recommendations")
-            
-            tips = []
-            
-            # Imbalance Check
-            amps_a = data.get('FD Fan-A Amps', 0)
-            amps_b = data.get('FD Fan-B Amps', 0)
-            if abs(amps_a - amps_b) > 5.0:
-                tips.append(f"🔴 **Load Imbalance:** Fan A and B differ by {abs(amps_a-amps_b):.1f} Amps. Check blade pitch sync.")
-            
-            # Efficiency/Flow Check (Simple heuristic)
-            air_flow = data.get('Air Flow', 0)
-            load = data.get('Load', 0)
-            # Example rule: At 200MW, expect ~600 T/hr. If flow is < 500, check blockage.
-            if load > 150 and air_flow < 400:
-                tips.append("🟠 **Low Air Flow:** Flow is lower than expected for this Load. Check for APH clogging or Filter blockage.")
-            
-            if not tips:
-                st.success("✅ System is operating within normal parameters.")
+                # 3. Dashboard
+                st.subheader("📊 Live Data")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Load", f"{data.get('Load', 0)} MW")
+                c2.metric("Air Flow", f"{data.get('Air Flow', 0)} T/Hr")
+                c3.metric("Fuel Flow", f"{data.get('Fuel Flow', 0)} T/Hr")
+                
+                st.subheader("⚠️ Fan Health")
+                k1, k2 = st.columns(2)
+                
+                vib_a = data.get('FD Fan-A Vib', 0)
+                k1.metric("Fan A Vib", f"{vib_a} mm/s")
+                if vib_a > 4.5: k1.error("High Vibration!")
+                
+                vib_b = data.get('FD Fan-B Vib', 0)
+                k2.metric("Fan B Vib", f"{vib_b} mm/s")
+                
+                with st.expander("See Raw Data"):
+                    st.json(data)
+                    
             else:
-                for tip in tips:
-                    st.write(tip)
-
+                st.error(f"Alignment Failed: {err}. Try moving closer to the screen.")

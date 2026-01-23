@@ -45,18 +45,23 @@ def align_images(image, reference):
     img_gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     ref_gray = cv2.cvtColor(reference, cv2.COLOR_RGB2GRAY)
     
-    # FIX: Use 'nfeatures' instead of MAX_FEATURES
+    # FIX 1: Use 'nfeatures' instead of MAX_FEATURES
     orb = cv2.ORB_create(nfeatures=1000)
     
     # Find keypoints and descriptors
     keypoints1, descriptors1 = orb.detectAndCompute(img_gray, None)
     keypoints2, descriptors2 = orb.detectAndCompute(ref_gray, None)
     
+    # Safety Check: If image is blurry/blank, descriptors might be None
+    if descriptors1 is None or descriptors2 is None:
+        return None, "Could not find distinct features. Image too blurry?"
+
     # Match features
     matcher = cv2.DescriptorMatcher_create(cv2.DESCRIPTOR_MATCHER_BRUTEFORCE_HAMMING)
     matches = matcher.match(descriptors1, descriptors2, None)
     
-    # Sort matches by score
+    # FIX 2: Convert tuple to list before sorting (Fixes AttributeError)
+    matches = list(matches)
     matches.sort(key=lambda x: x.distance, reverse=False)
     
     # Remove bad matches (keep top 15%)
@@ -64,7 +69,7 @@ def align_images(image, reference):
     matches = matches[:numGoodMatches]
     
     if len(matches) < 4:
-        return None, "Not enough features found. Try moving closer."
+        return None, "Not enough features found. Try moving closer to the screen."
 
     # Extract location of good matches
     points1 = np.zeros((len(matches), 2), dtype=np.float32)
@@ -123,6 +128,7 @@ if ref_file:
     st.sidebar.image(ref_image, caption="Master Reference", width=200)
     
     st.write("### 📸 Live Plant Monitor")
+    st.info("Tip: Ensure the screen fills most of the photo.")
     live_file = st.camera_input("Take a photo of the screen")
     
     if live_file:
@@ -171,6 +177,9 @@ if ref_file:
                     vib = data.get('FD Fan-B mmSe', 0)
                     st.metric("Vibration", f"{vib} mm/s")
                     if vib > 4.5: st.error("High Vibration!")
+                    
+                with st.expander("See Raw Data"):
+                    st.json(data)
                     
             else:
                 st.error(f"⚠️ Alignment Failed: {err}")
